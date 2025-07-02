@@ -1,0 +1,1377 @@
+# 📚 Φόρτωση βασικών βιβλιοθηκών 📚 
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(caret)
+library(ggplot2)
+library(minpack.lm)
+
+
+
+# Ορισμός διαδρομής αρχείου 📁
+INITIAL_DATA <- read.csv("C:/Users/o.dimgkiokas/Downloads/INITIAL_DATA.csv", sep=";")
+
+# 🧩 Στο INITIAL_DATA δημιουργώ τη στήλη Piece, μοιράζοντας με τυχαίο τρόπο όλες τις καταχωρήσεις σε 5 κατηγορίες.
+
+INITIAL_DATA$Piece <- sample(1:5, size = nrow(INITIAL_DATA), replace = TRUE)
+piece_counts <- INITIAL_DATA %>%
+  group_by(Piece) %>%
+  summarise(Count = n())
+print(piece_counts)
+
+
+# ============================================================
+#             📌  TRAINING DATA SET (IN -SAMPLE) 📈 📌
+# ============================================================
+# Δημιουργώ το TRAINING_DATA με δεδομένα μόνο των Pieces 1-4 🧩
+
+TRAINING_DATA <- INITIAL_DATA %>%
+  filter(Piece %in% 1:4)
+
+
+
+# ============================================================
+#         ⚙️ DATA PREPARATION  ⚙️
+# ============================================================
+
+
+# Κάνουμε rename τις στήλες TURNOVER_YEAR_SIGNED σε x1, EMPLOYEES_YEAR_SIGNED σε x2,EBTA_YEAR_SIGNED σε x3.
+TRAINING_DATA <- TRAINING_DATA %>%
+  rename(x1 = `TURNOVER_YEAR_SIGNED`,x2= `EMPLOYEES_YEAR_SIGNED`,x3 = `EBTA_YEAR_SIGNED` )
+
+# ====================================================================
+# ⚙️ Δημιουργία Κοινής Συνάρτησης: prepare_data_column⚙️
+# - Μετατρέπει τη στήλη σε numeric (αντικαθιστώντας κόμμα → τελεία).
+#   - Αν remove_na = TRUE, διαγράφει τις γραμμές με NA (μετά το καθαρισμό τιμών ≤ 0).
+#   - Αν filter_outliers = TRUE, υπολογίζει Q1, Q3 και IQR, και φιλτράρει (διαγράφει) τις γραμμές με τιμές εκτός του εύρους [Q1, large_outlier_threshold].
+# Παράμετροι:
+#   df: DataFrame με τα δεδομένα.
+#   col_name: Όνομα στήλης προς επεξεργασία.
+#   remove_na: TRUE για διαγραφή γραμμών με NA, FALSE για διατήρηση.
+#   filter_outliers: TRUE για φιλτράρισμα outliers, FALSE για παράλειψη.
+# ====================================================================
+prepare_data_column <- function(df, col_name, remove_na = TRUE, filter_outliers = TRUE) {
+  cat("------------------------------------------------------------\n")
+  cat("Επεξεργασία στήλης:", col_name, "\n")
+  
+  # Αρχική επισκόπηση: γραμμές, ελάχιστη και μέγιστη τιμή
+  cat("  Αρχικές γραμμές:", nrow(df), 
+      " | Min:", min(df[[col_name]], na.rm = TRUE), 
+      " | Max:", max(df[[col_name]], na.rm = TRUE), "\n")
+  
+  # Μετατροπή σε numeric: αντικατάσταση κόμματος με τελεία
+  df[[col_name]] <- as.numeric(gsub(",", ".", df[[col_name]]))
+  
+  # Καθαρισμός: τιμές ≤ 0 → NA
+  df[[col_name]][df[[col_name]] <= 0] <- NA
+  
+  # Διαγραφή γραμμών με NA αν remove_na = TRUE
+  if (remove_na) {
+    df <- df[complete.cases(df[[col_name]]), ]
+    cat("Μετά διαγραφή NA:\n")
+    cat("  Γραμμές:", nrow(df), 
+        " | Min:", min(df[[col_name]], na.rm = TRUE), 
+        " | Max:", max(df[[col_name]], na.rm = TRUE), "\n")
+  } else {cat("Διατήρηση γραμμών με NA.\n")}
+  
+  # Φιλτράρισμα outliers αν filter_outliers = TRUE
+  if (filter_outliers) {
+    
+    # Υπολογισμός Q1, Q3 και IQR
+    Q1 <- quantile(df[[col_name]], 0.25, na.rm = TRUE)
+    Q3 <- quantile(df[[col_name]], 0.75, na.rm = TRUE)
+    IQR_val <- Q3 - Q1
+    small_outlier_threshold <- Q1 - 1.5 * IQR_val
+    large_outlier_threshold <- Q3 + 1.5 * IQR_val
+    cat("Outlier όρια: Small =", small_outlier_threshold, " | Large =", large_outlier_threshold, "\n")
+    
+    # Διαγραφή γραμμών με τιμές εκτός του εύρους [Q1, large_outlier_threshold]
+    
+    df <- df[df[[col_name]] >= Q1 & df[[col_name]] <= large_outlier_threshold, ]
+  } else {cat("Παράλειψη φιλτραρίσματος outliers.\n")}
+  
+  # Τελική επισκόπηση
+  cat("Τελικές γραμμές:", nrow(df), 
+      " | Min:", min(df[[col_name]], na.rm = TRUE), 
+      " | Max:", max(df[[col_name]], na.rm = TRUE), "\n")
+  cat("------------------------------------------------------------\n")
+  return(df)}
+
+# ============================================================
+# ============================================================
+
+
+
+
+#Βήμα 1: Κατηγοριοποιώ τα ταμεία με 0 και 1 ώστε μετέπειτα να χρησιμοποιώ μόνο αυτά με το 1. Τα ταμεία με 1 είναι αυτά που συμμετέχουν στους υπολογισμούς και κατά κανόνα, ταμεία που έχει ολοκληρωθεί το 80% των εκταμιεύσεων τους.
+colnames(TRAINING_DATA)[which(colnames(TRAINING_DATA) == "TAMEIO_DESCR")] <- "Ταμείο"
+ΤΑΜΕΙΟ <- data.frame(Ταμείο = c("Ταμείο DeLFI", "Ταμείο Digital", "Ταμείο Green", "Ταμείο Housing", "Ταμείο Liquid", "Ταμείο Δυτικής Μακεδονίας", "Ταμείο Εγγυοδοσίας COVID-19", 
+                                "Ταμείο Εγγυοδοσίας ΕΑΤ-ΤΜΕΔΕ", "Ταμείο Εγγυοδοσίας Καινοτομίας", "Ταμείο Εγγυοδοσίας Οπτικοακουστικών Έργων", "Ταμείο Επιχειρηματικότητας II", 
+                                "Ταμείο Επιχειρηματικότητας III Εγγυοδοτικό", "Ταμείο Επιχειρηματικότητας III Συγχρηματοδοτούμενο", "Ταμείο Μικρών Δανείων Αγροτικής Επιχειρηματικότητας"),
+                     Dummy = c(NA, NA, NA, NA, NA, 1, 1, NA, NA, NA, 1, NA, NA, NA))
+ΤΑΜΕΙΟ$Dummy <- ifelse(is.na(ΤΑΜΕΙΟ$Dummy), 0, ΤΑΜΕΙΟ$Dummy)
+colnames(ΤΑΜΕΙΟ)[which(colnames(ΤΑΜΕΙΟ) == "Dummy")] <- "ΤΑΜΕΙΟ"
+colnames(ΤΑΜΕΙΟ)[which(colnames(ΤΑΜΕΙΟ) == "ΤΑΜΕΙΟ")] <- "ON/OFF"
+
+
+#Βήμα 2: Δημιουργώ στο TRAINING_DATA μια νέα στήλη που κατηγοριοποιεί τα δάνεια σε 1 ή όχι 1 ανάλογα του ταμείου του βήματος 1.
+selected_tameia <- c("Ταμείο Εγγυοδοσίας COVID-19", "Ταμείο Επιχειρηματικότητας II", "Ταμείο Εγγυοδοσίας ΕΑΤ-ΤΜΕΔΕ")
+TRAINING_DATA <- TRAINING_DATA %>%
+  left_join(ΤΑΜΕΙΟ, by = "Ταμείο") %>% 
+  mutate(Ταμείο_ON = if_else(Ταμείο %in% selected_tameia, 1, 0))
+
+
+#Βήμα 3: Δημιουργώ νέο DATA με ονομασία TRAINING_DATA2 φιλτράροντας μόνο τις σειρές των δεδομένων που έχουν στη νέα στήλη του βήματος 2 το 1.
+TRAINING_DATA2 <- TRAINING_DATA %>%
+  filter(Ταμείο_ON == 1)
+
+
+#Βήμα 4: Κατηγοριοποιώ την κατάσταση δανείου σε χαμηλού ή υψηλού ρίσκου ανάλογα με την κατάσταση καθυστέρησης. Η προσωρινή καθυστέρηση είναι χαμηλού ρίσκου αν η οικονομία μεγενθύνεται και υψηλού αν συρρικνώνεται. 
+economy_expands <- TRUE  
+STATUS <- data.frame(
+  Καθυστέρηση_CONS = c("Αποπληρωμένο", "Ενήμερο", "30dpd", "Προσωρινή", "Οριστική", "Προς καταγγελία"),
+  RiskLevel = c("LowRisk", "LowRisk", "LowRisk", ifelse(isTRUE(economy_expands == TRUE), "LowRisk", "HighRisk"), "LowRisk", "HighRisk"),
+  Comment = c("", "", "", "*If economy expands then LowRisk else HighRisk", "", ""))
+
+
+#Βήμα 5: Στο TRAINING_DATA2 δημιουργώ τη στήλη RiskLevel όπου κατηγοριοποιεί τα δάνεια σε low risk ή high risk βάσει του πίνακα του βήματος 4.
+TRAINING_DATA2 <- TRAINING_DATA2 %>%
+  left_join(STATUS, by = c("Καθυστέρηση_CONS" = "Καθυστέρηση_CONS"))
+TRAINING_DATA2<- TRAINING_DATA2 %>%
+  select(RiskLevel, everything()) # Τοποθετούμε τη στήλη RiskLevel στην αρχή του TRAINING_DATA2.
+
+
+
+# =============================================================================
+#  Δημιουργώ τρία ανεξάρτητα μοντέλα, ένα για κάθε attribute (x1, x2, x3).
+# =============================================================================
+
+# =============================================================================
+# Ορισμός της γενικής sigmoid συνάρτησης (θα χρησιμοποιηθεί σε όλα τα μοντέλα)
+# =============================================================================
+# Η συνάρτηση υπολογίζει την τιμή της sigmoid:
+# f(x) = L / (1 + exp(-k * (x - x0)))
+
+sigmoid <- function(x, L, x0, k) {
+  # Επιστρέφει τη σιγμοειδή τιμή:
+  # f(x) = L / (1 + exp(-k * (x - x0)))
+  L / (1 + exp(-k * (x - x0)))}
+# =============================================================================
+
+
+
+# ============================================================
+#                     📌 MODEL x1 📌
+# ============================================================
+
+
+# Βήμα 1_x1: Δημιουργώ νέο DATA: TRAINING_DATA_x1 επιλέγοντας μόνο τις στήλες x1 και RiskLevel 
+TRAINING_DATA_x1 <- TRAINING_DATA2 %>%
+  select(x1, RiskLevel)
+
+# Βήμα 2_x1: Εφαρμόζω για την συνάρτηση  prepare_data_column για το x1.
+TRAINING_DATA_x1 <- prepare_data_column(TRAINING_DATA_x1, "x1", remove_na = TRUE, filter_outliers = TRUE)
+
+# 📊  Βήμα 3_x1: Υπολογίζω τα 2 thresholds στο TRAINING_DATA_x1 κολώνα x1.
+sss1<-boxplot(TRAINING_DATA_x1$x1)
+low_threshold_x1 <- sss1$stats[1,1]
+high_threshold_x1 <- sss1$stats[3,1]
+print(low_threshold_x1)
+print(high_threshold_x1)
+
+#Bήμα 4_x1 Δημιουργία νέας στήλης x1_CLASS με βάση τα 2 thresholds του βήματος 3_x1.
+TRAINING_DATA_x1 <- TRAINING_DATA_x1 %>%
+  mutate(x1_CLASS = ifelse(x1 < low_threshold_x1, 1,
+                           ifelse(x1 <= high_threshold_x1, 2, 3)))
+
+# 📋 Βήμα 5_x1: Δημιουργώ πίνακα βάσει του βήματος 3_x1 όπου η 1η κολώνα αποτελείται από δεδομένα γύρω από τα thresholds και 2η κολώνα την κλάση που ανήκει ο αριθμός της 1ης κολώνας.
+threshold_table_x1_CLASS <- data.frame(
+  x1 = c(low_threshold_x1 * 0.1, 
+         low_threshold_x1 * 0.5, 
+         low_threshold_x1 * 0.9, 
+         low_threshold_x1 * 1.1,
+         (low_threshold_x1 + high_threshold_x1) / 2, 
+         high_threshold_x1 * 0.9, 
+         high_threshold_x1 * 1.1,
+         high_threshold_x1 * 1.5,
+         high_threshold_x1 * 2.0),
+  Class = c(1, 1, 2, 2, 3, 4, 4, 5, 5))
+print(threshold_table_x1_CLASS)
+
+# 📋 Βήμα 6_x1: Υπολογισμός ποσοστών HighRisk ανά κατηγορία (CLASS) για το TRAINING_DATA_x1
+risk_percentage_table <- TRAINING_DATA_x1 %>%
+  group_by(RiskLevel, x1_CLASS) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  group_by(x1_CLASS) %>%
+  mutate(Percentage = (Count / sum(Count)) * 100) %>%
+  select(RiskLevel, x1_CLASS, Count, Percentage) %>%
+  arrange(x1_CLASS)
+print(risk_percentage_table)
+
+# =============================================================================
+#   Βήμα 7_x1: δημιουργώ το  sigmoid  μοντέλο βάσει των δεδομένων του βήματος 5_x1.
+# =============================================================================
+
+
+#Βήμα 7_x1.1: Ορισμός δεδομένων για το x1 μοντέλο.
+x1 <- threshold_table_x1_CLASS$x1    
+Class_x1 <- threshold_table_x1_CLASS$Class  
+
+
+# 7_x1.2: Προσαρμογή της sigmoid καμπύλης χρησιμοποιώντας nls()
+# Εφαρμόζουμε μη γραμμική παλινδρόμηση για να εκτιμήσουμε τις παραμέτρους της sigmoid (L, x0, k)
+fit_sigmoid_x1 <- nlsLM(Class_x1 ~ L / (1 + exp(-k * (x1 - x0))),
+                        start = list(L = max(Class_x1), x0 = median(x1), k = 0.000001),
+                        data = data.frame(x1, Class_x1),
+                        control = nls.lm.control(maxiter = 1000))
+
+
+# 7_x1.3: Εξαγωγή των παραμέτρων του μοντέλου x1.
+
+params_x1 <- coef(fit_sigmoid_x1)
+L_hat_x1 <- params_x1["L"]
+x0_hat_x1 <- params_x1["x0"]
+k_hat_x1 <- params_x1["k"]
+cat("Sigmoid model parameters for x1:\n")
+cat("L =", L_hat_x1, "\n")
+cat("x0 =", x0_hat_x1, "\n")
+cat("k =", k_hat_x1, "\n")
+
+
+
+# 7_x1.4: Δημιουργία ομαλής καμπύλης για οπτικοποίηση του x1
+x1_smooth <- seq(min(x1), max(x1), length.out = 100)
+Class_smooth <- sigmoid(x1_smooth, L_hat_x1, x0_hat_x1, k_hat_x1)
+
+# 7_x1.5: Προετοιμασία δεδομένων για οπτικοποίηση με ggplot
+smooth_data_x1 <- data.frame(x1 = x1_smooth, Class = Class_smooth)
+actual_data_x1 <- data.frame(x1 = x1, Class = Class_x1)
+
+#📈 7_x1.6: Σχεδίαση των δεδομένων και της προσαρμοσμένης καμπύλης.
+ggplot() +geom_point(data = actual_data_x1, aes(x = x1, y = Class), color = "blue", size = 3) +
+  geom_line(data = smooth_data_x1, aes(x = x1, y = Class), color = "red", size = 1) +
+  labs(title = "Sigmoid Fit for x1_CLASS", x = "x1", y = "Class") +
+  theme_minimal()
+
+
+
+# ============================================================
+#                      📌 MODEL x2 📌
+# ============================================================
+
+
+# Βήμα 1_x2: Δημιουργώ νέο DATA: TRAINING_DATA_x2 επιλέγοντας μόνο τις στήλες x2 και RiskLevel 
+TRAINING_DATA_x2 <- TRAINING_DATA2 %>%
+  select(x2, RiskLevel)
+
+# Bημα 2_x2: Εφαρμόζω για την συνάρτηση  prepare_data_column για το x2.
+TRAINING_DATA_x2 <- prepare_data_column(TRAINING_DATA_x2, "x2", remove_na = TRUE, filter_outliers = TRUE)
+
+# 📊 Βήμα 3_x2: Υπολογίζω τα 2 thresholds στο TRAINING_DATA_x2 κολώνα x2.
+sss2<-boxplot(TRAINING_DATA_x2$x2)
+low_threshold_x2 <- sss2$stats[1,1]
+high_threshold_x2 <- sss2$stats[3,1]
+print(low_threshold_x2)
+print(high_threshold_x2)
+
+# Βήμα 4_x2: Δημιουργία νέας στήλης x2_CLASS με βάση τα 2 thresholds
+TRAINING_DATA_x2 <- TRAINING_DATA_x2 %>%
+  mutate(x2_CLASS = ifelse(x2 < low_threshold_x2, 1,  # Κλάση 1 
+                           ifelse(x2 <= high_threshold_x2, 2,  # Κλάση 2 
+                                  3)))  # Κλάση 3 (25% των δεδομένων)
+print (low_threshold_x2)
+print(high_threshold_x2)
+
+
+
+#📋 Βήμα 5_x2: Δημιουργώ πίνακα βάσει του βήματος 3_x2 όπου η 1η κολώνα αποτελείται από δεδομένα γύρω από τα thresholds και 2η κολώνα την κλάση που ανήκει ο αριθμός της 1ης κολώνας.
+threshold_table_x2_CLASS <- data.frame(
+  x2 = c(low_threshold_x2 * 0.1, 
+         low_threshold_x2 * 0.5, 
+         low_threshold_x2 * 0.9, 
+         low_threshold_x2 * 1.1,
+         (low_threshold_x2 + high_threshold_x2) / 2, 
+         high_threshold_x2 * 0.9, 
+         high_threshold_x2 * 1.1,
+         high_threshold_x2 * 1.5,
+         high_threshold_x2 * 2.0),
+  Class = c(1, 1, 2, 2, 3, 4, 4, 5, 5))
+print(threshold_table_x2_CLASS)
+
+
+
+
+#📋 Βήμα 6_x2: Υπολογισμός ποσοστών HighRisk ανά κατηγορία (CLASS) για το TRAINING_DATA_x2
+risk_percentage_table <- TRAINING_DATA_x2 %>%
+  group_by(RiskLevel, x2_CLASS) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  group_by(x2_CLASS) %>%
+  mutate(Percentage = (Count / sum(Count)) * 100) %>%
+  select(RiskLevel, x2_CLASS, Count, Percentage) %>%
+  arrange(x2_CLASS)
+print(risk_percentage_table)
+
+
+
+# ============================================================
+#Βήμα 7_x2: δημιουργώ το  sigmoid  μοντέλο βάσει των δεδομένων του βήματος 5_x2.             
+# ============================================================
+
+# 7_x2.1: Ορισμός δεδομένων για το μοντέλο x2
+x2 <- threshold_table_x2_CLASS$x2      
+Class_x2 <- threshold_table_x2_CLASS$Class  
+
+# 7_x2.2: Προσαρμογή της sigmoid καμπύλης με nlsLM() για το x2
+# Χρησιμοποιούμε nlsLM() από το πακέτο minpack.lm για καλύτερη σύγκλιση με λίγα δεδομένα
+
+fit_sigmoid_x2 <- nlsLM(Class_x2 ~ L / (1 + exp(-k * (x2 - x0))),
+                        start = list(L = max(Class_x2), x0 = median(x2), k = 0.000001),
+                        data = data.frame(x2, Class_x2),
+                        control = nls.lm.control(maxiter = 1000))
+
+
+# 7_x2.3: Εξαγωγή των παραμέτρων από το μοντέλο x2.
+params_x2 <- coef(fit_sigmoid_x2)
+L_hat_x2 <- params_x2["L"]
+x0_hat_x2 <- params_x2["x0"]
+k_hat_x2 <- params_x2["k"]
+
+cat("Sigmoid model parameters for x2:\n")
+cat("L =", L_hat_x2, "\n")
+cat("x0 =", x0_hat_x2, "\n")
+cat("k =", k_hat_x2, "\n")
+
+
+# 7_x2.4: Δημιουργία ομαλής καμπύλης για οπτικοποίηση του x2
+x2_smooth <- seq(min(x2), max(x2), length.out = 100)
+Class_smooth_x2 <- sigmoid(x2_smooth, L_hat_x2, x0_hat_x2, k_hat_x2)
+
+# 7_x2.5: Προετοιμασία δεδομένων για οπτικοποίηση με ggplot για το x2
+smooth_data_x2 <- data.frame(x2 = x2_smooth, Class = Class_smooth_x2)
+actual_data_x2 <- data.frame(x2 = x2, Class = Class_x2)
+
+# 📈 7_x2.6: Οπτικοποίηση της προσαρμοσμένης sigmoid καμπύλης για το x2.
+library(ggplot2)
+ggplot() +
+  geom_point(data = actual_data_x2, aes(x = x2, y = Class), color = "blue", size = 3) +
+  geom_line(data = smooth_data_x2, aes(x = x2, y = Class), color = "red", size = 1) +
+  labs(title = "Sigmoid Fit for x2_CLASS", x = "x2", y = "Class") +
+  theme_minimal()
+
+
+
+# ============================================================
+#                      📌 MODEL x3 📌
+# ============================================================
+
+# Bημα 1_x3: Δημιουργώ νέο DATA: TRAINING_DATA_x3 επιλέγοντας μόνο τις στήλες x3 και RiskLevel 
+TRAINING_DATA_x3 <- TRAINING_DATA2 %>%
+  select(x3, RiskLevel)
+
+# Βήμα 2_x3: Εφαρμόζω για την συνάρτηση  prepare_data_column για το x3.
+TRAINING_DATA_x3 <- prepare_data_column(TRAINING_DATA_x3, "x3", remove_na = TRUE, filter_outliers = TRUE)
+
+
+#📊 Βήμα 3_x3: Υπολογίζω τα 2 thresholds στο TRAINING_DATA_x3, κολώνα x3.
+sss3<-boxplot(TRAINING_DATA_x3$x3)
+low_threshold_x3 <- sss3$stats[1,1]
+high_threshold_x3 <- sss3$stats[3,1]
+print(low_threshold_x3)
+print(high_threshold_x3)
+
+#Βήμα 4_x3: Δημιουργία νέας στήλης x3_CLASS με βάση τα 2 thresholds.
+TRAINING_DATA_x3 <- TRAINING_DATA_x3 %>%
+  mutate(x3_CLASS = ifelse(x3 < low_threshold_x3, 1,
+                           ifelse(x3 <= high_threshold_x3, 2, 3)))
+
+#📋 Βήμα 5_x3: Φτιάχνω πίνακα βάσει του βήματος 3_x3 όπου η 1η κολώνα αποτελείται από δεδομένα γύρω από τα thresholds και 2η κολώνα την κλάση που ανήκει ο αριθμός της 1ης κολώνας.
+threshold_table_x3_CLASS <- data.frame(
+  x3 = c(low_threshold_x3 * 0.1, 
+         low_threshold_x3 * 0.5, 
+         low_threshold_x3 * 0.9, 
+         low_threshold_x3 * 1.1,
+         (low_threshold_x3 + high_threshold_x3) / 2, 
+         high_threshold_x3 * 0.9, 
+         high_threshold_x3 * 1.1,
+         high_threshold_x3 * 1.5,
+         high_threshold_x3 * 2.0),
+  Class = c(1, 1, 2, 2, 3, 4, 4, 5, 5))
+print(threshold_table_x3_CLASS)
+
+# 📋 Βήμα 6_x3: Υπολογισμός ποσοστών HighRisk ανά κατηγορία (CLASS) για το TRAINING_DATA_x3
+risk_percentage_table <- TRAINING_DATA_x3 %>%
+  group_by(RiskLevel, x3_CLASS) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  group_by(x3_CLASS) %>%
+  mutate(Percentage = (Count / sum(Count)) * 100) %>%
+  select(RiskLevel, x3_CLASS, Count, Percentage) %>%
+  arrange(x3_CLASS)
+print(risk_percentage_table)
+
+# ============================================================
+#Βήμα 7_x3: δημιουργώ το  sigmoid  μοντέλο βάσει των δεδομένων του βήματος 5_x3.   
+# ============================================================
+
+# 7_x3.1: Ορισμός δεδομένων για το μοντέλο x3
+x3 <- threshold_table_x3_CLASS$x3    # ανεξάρτητη μεταβλητή για το x3
+Class_x3 <- threshold_table_x3_CLASS$Class  # εξαρτημένη μεταβλητή (η κατηγορία για το x3)
+
+# 7_x3.2: Προσαρμογή της sigmoid καμπύλης με nlsLM() για το x3
+fit_sigmoid_x3 <- nlsLM(Class_x3 ~ L / (1 + exp(-k * (x3 - x0))),
+                        start = list(L = max(Class_x3), x0 = median(x3), k = 0.000001),
+                        data = data.frame(x3, Class_x3),
+                        control = nls.control(maxiter = 1000))
+
+# 7_x3.3: Εξαγωγή των παραμέτρων από το μοντέλο x3
+params_x3 <- coef(fit_sigmoid_x3)
+L_hat_x3 <- params_x3["L"]
+x0_hat_x3 <- params_x3["x0"]
+k_hat_x3 <- params_x3["k"]
+
+cat("Sigmoid model parameters for x3:\n")
+cat("L =", L_hat_x3, "\n")
+cat("x0 =", x0_hat_x3, "\n")
+cat("k =", k_hat_x3, "\n")
+
+# 7_x3.4: Δημιουργία ομαλής καμπύλης για οπτικοποίηση του x3
+x3_smooth <- seq(min(x3), max(x3), length.out = 100)
+Class_smooth_x3 <- sigmoid(x3_smooth, L_hat_x3, x0_hat_x3, k_hat_x3)
+
+# 7_x3.5: Προετοιμασία δεδομένων για οπτικοποίηση με ggplot για το x3
+smooth_data_x3 <- data.frame(x3 = x3_smooth, Class = Class_smooth_x3)
+actual_data_x3 <- data.frame(x3 = x3, Class = Class_x3)
+
+# 📈 7_x3.6: Οπτικοποίηση της προσαρμοσμένης sigmoid καμπύλης για το x3
+ggplot() +
+  geom_point(data = actual_data_x3, aes(x = x3, y = Class), color = "blue", size = 3) +
+  geom_line(data = smooth_data_x3, aes(x = x3, y = Class), color = "red", size = 1) +
+  labs(title = "Sigmoid Fit for x3_CLASS", x = "x3", y = "Class") +
+  theme_minimal()
+
+
+
+
+# ============================================================
+#    🔗 ΕNΟΠΟΙΗΣΗ ΕΚΤΙΜΗΣΕΩΝ (model_x1, model_x2, model_x3)🔗
+#       & ΥΠΟΛΟΓΙΣΜΟΣ ΤΕΛΙΚΗΣ ΚΛΑΣΗΣ (Y_CLASS)
+#         ΕΦΑΡΜΟΓΗ ΣΤΟ TRAINING_DATA2 📈
+# ============================================================
+
+# ============================================================
+#     Βήμα 8: ⚙️ DATA PREPARATION ⚙️
+# ============================================================
+
+# Δημιουργώ νέο DATA:ΤRAINING_DATA_4_PIECES αντίγραφο του TRAINING_DATA2.
+TRAINING_DATA_4_PIECES <- TRAINING_DATA2
+
+# Εφαρμογή της συνάρτησης prepare_data_column στις στήλες x1, x2 και x3  χωρίς να αφαιρει NA ή να φιλτράρει outliers.
+
+# x1: Μετατροπή και προετοιμασία των τιμών της στήλης x1.
+TRAINING_DATA_4_PIECES <- prepare_data_column(TRAINING_DATA_4_PIECES, "x1", remove_na = FALSE, filter_outliers = FALSE)
+
+# x2: Μετατροπή και προετοιμασία των τιμών της στήλης x2.
+TRAINING_DATA_4_PIECES <- prepare_data_column(TRAINING_DATA_4_PIECES, "x2", remove_na = FALSE, filter_outliers = FALSE)
+
+# x3: Μετατροπή και προετοιμασία των τιμών της στήλης x3.
+TRAINING_DATA_4_PIECES <- prepare_data_column(TRAINING_DATA_4_PIECES, "x3", remove_na = FALSE, filter_outliers = FALSE)
+# ============================================================
+
+#Βήμα 9:🔗 Δημιουργία του μοντέλου y
+
+# ============================================================
+
+# Συνδυάζουμε τις εκτιμήσεις των sigmoid model x1, model x2, model x3, ώστε να παράγουμε την τελική κλάση Y_CLASS για κάθε παρατήρηση. 
+
+# Εξαγωγή παραμέτρων από το sigmoid model x1
+cat("Sigmoid model parameters for x1: ", "L =", L_hat_x1, "||", "x0 =", x0_hat_x1, "||", "k =", k_hat_x1, "\n")
+
+# Εξαγωγή παραμέτρων από το sigmoid mode x2
+cat("Sigmoid model parameters for x2: ", "L =", L_hat_x2, "||", "x0 =", x0_hat_x2, "||", "k =", k_hat_x2, "\n")
+
+# Εξαγωγή παραμέτρων από το sigmoid mode x3
+cat("Sigmoid model parameters for x3: ", "L =", L_hat_x3, "||", "x0 =", x0_hat_x3, "||", "k =", k_hat_x3, "\n")
+
+
+
+
+# ============================================================
+#   
+# 🧮 Βήμα 10: Υπολογισμός της τελικής κλάσης Y_CLASS στο TRAINING_DATA_4_PIECES.
+#  
+# ============================================================
+# Βήμα 10.1: Υπολογισμός των εκτιμήσεων y1_model, y2_model, y3_model από τα αντίστοιχα sigmoid model.
+TRAINING_DATA_4_PIECES <- TRAINING_DATA_4_PIECES %>%
+  mutate(y1_model = L_hat_x1 / (1 + exp(-k_hat_x1 * (x1 - x0_hat_x1))),
+         y2_model = L_hat_x2 / (1 + exp(-k_hat_x2 * (x2 - x0_hat_x2))),
+         y3_model = L_hat_x3 / (1 + exp(-k_hat_x3 * (x3 - x0_hat_x3)))) %>%
+  
+# Εάν υπάρχουν NA τιμές στις προβλέψεις, τις αντικαθιστούμε με 0.8 ως fallback.
+  mutate(y1_model = ifelse(is.na(y1_model), 0.8, y1_model),y2_model = ifelse(is.na(y2_model), 0.8, y2_model),
+         y3_model = ifelse(is.na(y3_model), 0.8, y3_model)) %>%
+  
+  # Βήμα 10.2: Υπολογισμός της κυβικής ρίζας του γινομένου των y1, y2, y3
+  mutate(Y_CLASS_MODEL = (y1_model * y2_model * y3_model)^(1/3)) %>%
+  
+  # Βήμα 10.3: Εφαρμογή της συνθήκης (1 ≤ Y_CLASS_MODEL ≤ 5) ώστε οι προβλέψεις να περιορίζονται στο εύρος [1, 5] και στρογγυλοποίηση στην  πλησιέστερη ακέραιη τιμή.
+  mutate(Y_CLASS_MODEL = ifelse(Y_CLASS_MODEL < 1, 1,
+                                ifelse(Y_CLASS_MODEL > 5, 5, round(Y_CLASS_MODEL, 0)))) %>%
+  
+  # Βήμα 10.4: Τοποθέτηση της στήλης Y_CLASS_MODEL στην αρχή του TRAINING_DATA_4_PIECES
+  select(Y_CLASS_MODEL,y1_model, y2_model, y3_model, everything())
+
+
+
+# ============================================================
+# Βήμα 11 Δημιουργια νέας στήλης RISK_MODEL, στην οποία ορίζω ως HighRisk τις τιμές 1,2 της Y_CLASS_MODEL και αντίστοιχα τις τιμές 3, 4, 5 ως LowRisk.
+TRAINING_DATA_4_PIECES <- TRAINING_DATA_4_PIECES %>%
+  mutate(RISK_MODEL = case_when(
+    Y_CLASS_MODEL %in% c(1, 2) ~ "HighRisk",
+    Y_CLASS_MODEL %in% c(3, 4, 5) ~ "LowRisk"))
+
+
+TRAINING_DATA_4_PIECES <- TRAINING_DATA_4_PIECES %>%
+  select(RISK_MODEL, everything())  # Τοποθετούμε τη στήλη RISK_MODEL στην αρχή του TRAINING_DATA_4_PIECES.
+
+
+#📋 Βήμα 12: Δημιουργία πίνακα ποσοστου του RiskLevel ανα κλαση Υ_CLASS_MODEL
+
+model_risklevel_table <- TRAINING_DATA_4_PIECES %>%
+  group_by(Y_CLASS_MODEL, RiskLevel) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  mutate(Y_CLASS_MODEL = as.character(Y_CLASS_MODEL)) %>%
+  pivot_wider(names_from = RiskLevel, values_from = Count, values_fill = list(Count = 0)) %>%
+  mutate(
+    TotalCount = LowRisk + HighRisk,
+    LowRiskPerc = round(ifelse(TotalCount == 0, 0, LowRisk / TotalCount * 100), 1),
+    HighRiskPerc = round(ifelse(TotalCount == 0, 0, HighRisk / TotalCount * 100), 1)
+  )
+
+model_totals <- TRAINING_DATA_4_PIECES %>%
+  summarise(
+    TotalCount = n(),
+    LowRisk = sum(RiskLevel == "LowRisk"),
+    HighRisk = sum(RiskLevel == "HighRisk")
+  ) %>%
+  mutate(
+    Y_CLASS_MODEL = "Total",
+    LowRiskPerc = round(LowRisk / TotalCount * 100, 1),
+    HighRiskPerc = round(HighRisk / TotalCount * 100, 1)
+  )
+
+model_risklevel_table <- bind_rows(model_risklevel_table, model_totals) %>%
+  arrange(factor(Y_CLASS_MODEL, levels = c("1", "2", "3", "4", "5", "Total")))
+
+model_risklevel_table <- model_risklevel_table %>%
+  mutate(
+    LowRiskPerc = paste0(LowRiskPerc, "%"),
+    HighRiskPerc = paste0(HighRiskPerc, "%")
+  )
+print(model_risklevel_table)
+
+
+
+
+
+
+# ============================================================
+#                📌 TEST (OUT OF SAMPLE) 📌 📉
+# ============================================================
+# Δημιουργώ το TRAINING_DATA με δεδομένα μόνο τoυ Piece 5.🧩
+
+TEST_DATA <- INITIAL_DATA %>%
+  filter(Piece == 5)
+# ============================================================
+#        ⚙️ DATA PREPARATION ⚙️
+# ============================================================
+# Κάνουμε rename τις  στήλες TURNOVER_YEAR_SIGNED, EMPLOYEES_YEAR_SIGNED, EBTA_YEAR_SIGNED σε x1,x2,x3
+TEST_DATA <- TEST_DATA %>%rename(x1 = `TURNOVER_YEAR_SIGNED`,x2 = `EMPLOYEES_YEAR_SIGNED`, x3 = `EBTA_YEAR_SIGNED`)
+
+# Εφαρμόζω για την συνάρτηση  prepare_data_column για τις στήλες x1,x2, x3
+TEST_DATA <- prepare_data_column(TEST_DATA, "x1", remove_na = FALSE, filter_outliers = FALSE)
+TEST_DATA <- prepare_data_column(TEST_DATA, "x2", remove_na = FALSE, filter_outliers = FALSE)
+TEST_DATA <- prepare_data_column(TEST_DATA, "x3", remove_na = FALSE, filter_outliers = FALSE)
+# ============================================================
+
+
+#Βήμα 1: Κατηγοριοποιώ τα ταμεία με 0 και 1 ώστε μετέπειτα να χρησιμοποιώ μόνο αυτά με το 1. Τα ταμεία με 1 είναι αυτά που συμμετέχουν στους υπολογισμούς και κατά κανόνα, ταμεία που έχει ολοκληρωθεί το 80% των εκταμιεύσεων τους.
+colnames(TEST_DATA)[which(colnames(TEST_DATA) == "TAMEIO_DESCR")] <- "Ταμείο"
+ΤΑΜΕΙΟ <- data.frame(Ταμείο = c("Ταμείο DeLFI", "Ταμείο Digital", "Ταμείο Green", "Ταμείο Housing", "Ταμείο Liquid", "Ταμείο Δυτικής Μακεδονίας", "Ταμείο Εγγυοδοσίας COVID-19", 
+                                "Ταμείο Εγγυοδοσίας ΕΑΤ-ΤΜΕΔΕ", "Ταμείο Εγγυοδοσίας Καινοτομίας", "Ταμείο Εγγυοδοσίας Οπτικοακουστικών Έργων", "Ταμείο Επιχειρηματικότητας II", 
+                                "Ταμείο Επιχειρηματικότητας III Εγγυοδοτικό", "Ταμείο Επιχειρηματικότητας III Συγχρηματοδοτούμενο", "Ταμείο Μικρών Δανείων Αγροτικής Επιχειρηματικότητας"),
+                     Dummy = c(NA, NA, NA, NA, NA, 1, 1, NA, NA, NA, 1, NA, NA, NA))
+ΤΑΜΕΙΟ$Dummy <- ifelse(is.na(ΤΑΜΕΙΟ$Dummy), 0, ΤΑΜΕΙΟ$Dummy)
+colnames(ΤΑΜΕΙΟ)[which(colnames(ΤΑΜΕΙΟ) == "Dummy")] <- "ΤΑΜΕΙΟ"
+colnames(ΤΑΜΕΙΟ)[which(colnames(ΤΑΜΕΙΟ) == "ΤΑΜΕΙΟ")] <- "ON/OFF"
+
+
+#Βήμα 2: Δημιουργώ στο DATA μια νέα στήλη που κατηγοριοποιεί τα δάνεια σε 1 ή όχι 1 ανάλογα του ταμείου του βήματος 1.
+selected_tameia <- c("Ταμείο Εγγυοδοσίας COVID-19", "Ταμείο Επιχειρηματικότητας II", "Ταμείο Εγγυοδοσίας ΕΑΤ-ΤΜΕΔΕ")
+TEST_DATA <- TEST_DATA %>%
+  left_join(ΤΑΜΕΙΟ, by = "Ταμείο") %>% 
+  mutate(Ταμείο_ON = if_else(Ταμείο %in% selected_tameia, 1, 0))
+
+
+#Βήμα 3: Δημιουργώ νέο DATA με ονομασία TEST_DATA2 φιλτράροντας μόνο τις σειρές των δεδομένων που έχουν στη νέα στήλη του βήματος 2 το 1.
+TEST_DATA2<- TEST_DATA %>%
+  filter(Ταμείο_ON == 1)
+
+#Βήμα 4: Κατηγοριοποιώ την κατάσταση δανείου σε χαμηλού ή υψηλού ρίσκου ανάλογα με την κατάσταση καθυστέρησης. Η προσωρινή καθυστέρηση είναι χαμηλού ρίσκου αν η οικονομία μεγενθύνεται και υψηλού αν συρρικνώνεται. 
+economy_expands <- TRUE  
+STATUS <- data.frame(
+  Καθυστέρηση_CONS = c("Αποπληρωμένο", "Ενήμερο", "30dpd", "Προσωρινή", "Οριστική", "Προς καταγγελία"),
+  RiskLevel = c("LowRisk", "LowRisk", "LowRisk", ifelse(isTRUE(economy_expands == TRUE), "LowRisk", "HighRisk"), "LowRisk", "HighRisk"),
+  Comment = c("", "", "", "*If economy expands then LowRisk else HighRisk", "", ""))
+
+
+#Βήμα 5: Στο TEST_DATA2 δημιουργώ τη στήλη RiskLevel, όπου κατηγοριοποιεί τα δάνεια σε low risk ή high risk βάσει του πίνακα του βήματος 4.
+TEST_DATA2 <- TEST_DATA2 %>%
+  left_join(STATUS, by = c("Καθυστέρηση_CONS" = "Καθυστέρηση_CONS"))
+
+TEST_DATA2<- TEST_DATA2 %>%
+  select(RiskLevel, everything()) # Τοποθετούμε τη στήλη RiskLevel στην αρχή του TEST_DATA2.
+
+
+
+# ==============================================================================
+# 
+# 🔗 Βήμα 6: Υπολογισμός της τελικής κλάσης Y_CLASS_TEST για το TEST_DATA2 🔗 
+                    
+#ΕΦΑΡΜΟΓΗ ΣΤΟ TEST_DATA2  📉
+ 
+#===============================================================================
+# Βήμα 6.1: Υπολογισμός των εκτιμήσεων y1_test, y2_test, y3_test από τα αντίστοιχα sigmoid model.
+TEST_DATA2<- TEST_DATA2 %>%
+  mutate(y1_test = L_hat_x1 / (1 + exp(-k_hat_x1 * (x1 - x0_hat_x1))),
+         y2_test = L_hat_x2 / (1 + exp(-k_hat_x2 * (x2 - x0_hat_x2))),
+         y3_test = L_hat_x3 / (1 + exp(-k_hat_x3 * (x3 - x0_hat_x3)))) %>%
+  
+  # Εάν υπάρχουν NA τιμές στις προβλέψεις, τις αντικαθιστούμε με 0.8 ως fallback.
+  mutate(y1_test = ifelse(is.na(y1_test), 0.8, y1_test),y2_test = ifelse(is.na(y2_test), 0.8, y2_test),
+         y3_test = ifelse(is.na(y3_test), 0.8, y3_test)) %>%
+  
+  
+  # Βήμα 6.2: Υπολογισμός Y_CLASS_TEST ως κυβική ρίζα του γινομένου των y1, y2, y3
+  mutate(
+    Y_CLASS_TEST = (y1_test * y2_test * y3_test)^(1/3)
+  ) %>%
+  
+  # Βήμα 6.3: Εφαρμογή της συνθήκης (1 ≤ Y_CLASS ≤ 5) στην Y_CLASS και στρογγυλοποίηση στην  πλησιέστερη ακέραιη τιμή.
+  mutate(
+    Y_CLASS_TEST = ifelse(Y_CLASS_TEST < 1, 1,
+                          ifelse(Y_CLASS_TEST > 5, 5, round(Y_CLASS_TEST, 0)))
+  ) %>%
+  
+  # Βήμα 6.4: Τοποθέτούμε τη στήλη Y_CLASS στην αρχή του TEST_DATA2.
+  select(Y_CLASS_TEST, everything())
+
+
+# ============================================================
+
+#Βήμα 7: Δημιουργια νέας στήλης RISK_MODEL στο TEST_DATA2 , στην οποιά ορίζω ως HighRisk τις τιμες 1, 2 της Υ_CLASS και αντίστοιχα τις τιμές 3, 4,5 ως LowRisk.
+TEST_DATA2 <- TEST_DATA2 %>%
+  mutate(RISK_MODEL = case_when(
+    Y_CLASS_TEST %in% c(1,2) ~ "HighRisk",
+    Y_CLASS_TEST %in% c(3, 4, 5) ~ "LowRisk"))
+
+TEST_DATA2 <- TEST_DATA2 %>%
+  select(RISK_MODEL, everything())  # Τοποθετούμε τη στήλη RISK_MODEL στην αρχή του TEST_DATA2.
+
+
+#📋 Βήμα 8: Δημιουργία πίνακα ποσοστου του RiskLevel ανα κλαση Υ_CLASS_TEST
+test_risklevel_table <- TEST_DATA2 %>%
+  group_by(Y_CLASS_TEST, RiskLevel) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  mutate(Y_CLASS_TEST = as.character(Y_CLASS_TEST)) %>%
+  pivot_wider(names_from = RiskLevel, values_from = Count, values_fill = list(Count = 0)) %>%
+  mutate(
+    TotalCount = LowRisk + HighRisk,
+    LowRiskPerc = round(ifelse(TotalCount == 0, 0, LowRisk / TotalCount * 100), 1),
+    HighRiskPerc = round(ifelse(TotalCount == 0, 0, HighRisk / TotalCount * 100), 1))
+test_totals <- TEST_DATA2 %>%
+  summarise(
+    TotalCount = n(),
+    LowRisk = sum(RiskLevel == "LowRisk"),
+    HighRisk = sum(RiskLevel == "HighRisk")
+  ) %>%
+  mutate(
+    Y_CLASS_TEST = "Total",
+    LowRiskPerc = round(LowRisk / TotalCount * 100, 1),
+    HighRiskPerc = round(HighRisk / TotalCount * 100, 1))
+
+test_risklevel_table <- bind_rows(test_risklevel_table, test_totals) %>%
+  arrange(factor(Y_CLASS_TEST, levels = c("1", "2", "3", "4", "5", "Total")))
+
+test_risklevel_table <- test_risklevel_table %>%
+  mutate(
+    LowRiskPerc = paste0(LowRiskPerc, "%"),
+    HighRiskPerc = paste0(HighRiskPerc, "%"))
+
+print(test_risklevel_table)
+
+
+
+# ============================================================
+# ============================================================
+
+
+
+
+
+# ===============================================================================================
+# 📌 Υπολογισμός Δείκτη PSI (Population Stability Index)
+# Aξιολόγηση Σταθερότητας Μοντέλου
+# Η σύγκριση βασίζεται στους πίνακες: model_risklevel_table & test_risklevel_table.
+
+# ===============================================================================================
+
+# Βήμα 1: Υπολογισμός ποσοστού HighRisk ανά Κατηγορία (Train & Test)
+# ===============================================================================================
+
+# Συνάρτηση που υπολογίζει τα ποσοστά HighRisk για κάθε Y_CLASS (σε μορφή %)
+get_risk_perc <- function(data, class_col) {
+  data %>%
+    group_by(!!sym(class_col), RiskLevel) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    pivot_wider(names_from = RiskLevel, values_from = n, values_fill = 0) %>%
+    mutate(
+      Total = LowRisk + HighRisk,
+      HighRiskPerc = round(100 * HighRisk / Total, 1),
+      Y_CLASS = as.character(!!sym(class_col))
+    ) %>%
+    select(Y_CLASS, HighRiskPerc)}
+
+# ===============================================================================================
+#  Βήμα 2: Δημιουργία πίνακα σύγκρισης Train vs Test (validation_df)
+# ===============================================================================================
+
+# Η συνάρτηση υπολογίζει τη διαφορά ποσοστών ανά Y_CLASS και επιστρέφει:
+# - df_numeric: για υπολογισμούς PSI και γραφήματα
+# - df_display: μορφοποιημένο πίνακα για εκτύπωση (χωρίς PSI_Component)
+
+generate_validation_df <- function(train_data, test_data) {
+  train <- get_risk_perc(train_data, "Y_CLASS_MODEL")
+  test  <- get_risk_perc(test_data, "Y_CLASS_TEST")
+  
+  df_numeric <- left_join(train, test, by = "Y_CLASS", suffix = c("_Train", "_Test")) %>%
+    mutate(
+      Delta = round(HighRiskPerc_Test - HighRiskPerc_Train, 1),
+      PSI_Component = ((HighRiskPerc_Train / 100) - (HighRiskPerc_Test / 100)) *
+        log(ifelse(HighRiskPerc_Train * HighRiskPerc_Test == 0, 1,
+                   HighRiskPerc_Train / HighRiskPerc_Test)),
+      PSI_Component = round(PSI_Component, 6) )
+  
+  df_display <- df_numeric %>%
+    select(-PSI_Component) %>%
+    mutate(
+      HighRiskPerc_Train = paste0(HighRiskPerc_Train, "%"),
+      HighRiskPerc_Test = paste0(HighRiskPerc_Test, "%"),
+      Delta = paste0(Delta, "%"))
+  
+  list(numeric = df_numeric, display = df_display)}
+
+# ===============================================================================================
+# Βήμα 3: Εκτέλεση υπολογισμών – Δημιουργία Πίνακα Σταθερότητας
+# ===============================================================================================
+psi_tables <- generate_validation_df(TRAINING_DATA_4_PIECES, TEST_DATA2)
+
+validation_df_numeric <- psi_tables$numeric  # για plot & PSI
+validation_df <- psi_tables$display          # για παρουσίαση με %
+
+
+
+# ======================================================================================
+# 📊  Βήμα 4: Οπτικοποίηση της διαφοράς των ποσοστών HighRisk μεταξύ Training και Test
+# ======================================== =============================================
+ggplot(validation_df_numeric, aes(x = Y_CLASS)) +
+  geom_line(aes(y = HighRiskPerc_Train, group = 1, color = "Train"), size = 1.2) +
+  geom_line(aes(y = HighRiskPerc_Test, group = 1, color = "Test"), size = 1.2) +
+  geom_point(aes(y = HighRiskPerc_Train, color = "Train"), size = 3) +
+  geom_point(aes(y = HighRiskPerc_Test, color = "Test"), size = 3) +
+  scale_y_continuous(labels = scales::label_percent(scale = 1)) +
+  labs(
+    title = "High Risk % ανά Κατηγορία Y_CLASS (Train vs Test)",
+    subtitle = "Ανάλυση Σταθερότητας Μοντέλου",
+    x = "Y_CLASS", y = "High Risk %",
+    color = "Δείγμα"
+  ) +
+  theme_minimal(base_size = 14)
+
+# ========================================
+# Βήμα 5: 📋 ΠΙΝΑΚΑΣ ΣΥΓΚΡΙΣΗΣ TRAIN - TEST
+# ========================================
+print(validation_df)
+
+# ========================================
+# # Βήμα 6: 🧮 Υπολογισμός Συνολικού PSI
+# ========================================
+total_psi <- sum(validation_df_numeric$PSI_Component, na.rm = TRUE)
+cat("\n🔍 Συνολικό PSI:", round(total_psi, 4), "\n")
+
+# Επιχειρησιακή Ερμηνεία PSI
+if (total_psi < 0.1) {
+  cat("✅ Το μοντέλο είναι σταθερό. (PSI < 0.1)\n")
+} else if (total_psi < 0.25) {
+  cat("⚠️ Μέτρια απόκλιση – Συνιστάται παρακολούθηση.\n")
+} else {
+  cat("❌ Σημαντική απόκλιση – Προτείνεται αναθεώρηση μοντέλου.\n")
+}
+
+# ========================================================================================
+# Βήμα 7: 📑 ΠΙΝΑΚΑΣ ΕΡΜΗΝΕΙΑΣ PSI με βάση τα προκαθορισμένα όρια και τις προτεινόμενες ενέργειες
+# =========================================================================================
+
+psi_model_stability_assessment <- data.frame(
+  `Τιμή PSI` = c("< 0.10", "0.10 - 0.249", "≥ 0.25"),
+  `Ερμηνεία Δείκτη PSI` = c(
+    "Ισχυρή σταθερότητα – Το μοντέλο παρουσιάζει αμετάβλητη κατανομή κινδύνου σύμφωνα με τα δεδεμένα εκπαίδευσης και test.",
+    "Μέτρια σταθερότητα – Ελαφριά διαφορά στην κατανομή κινδύνου, που απαιτεί συνεχή παρακολούθηση.",
+    "Χαμηλή σταθερότητα – Σημαντική μετατόπιση στην κατανομή του ρίσκου, που υποδεικνύει την ανάγκη επανεκτίμησης του μοντέλου."),
+  `Προτεινόμενες Ενέργειες` = c(
+    "Δεν απαιτούνται ενέργειες. Το μοντέλο έχει διατηρήσει την αξιοπιστία του.",
+    "Συνιστάται η στενή παρακολούθηση για την περαιτέρω βελτίωση της απόδοσης του μοντέλου.",
+    "Απαιτείται άμεση αναθεώρηση του μοντέλου."),
+  check.names = FALSE,
+  stringsAsFactors = FALSE)
+print(psi_model_stability_assessment)
+
+
+
+
+
+
+
+
+
+
+
+
+# ===============================================================================================
+# 📌 SUMMARY
+# ===============================================================================================
+# Το μοντέλο ορίζεται ως εξής:
+#
+#   y1 = ( : … ) / (1 + exp(- ( : … ) * (LAST_TURNOVER - ( : … )))
+#   y2 = ( : … ) / (1 + exp(- ( : … ) * (LAST_EMPLOYEES - ( : … )))
+#   y3 = ( : … ) / (1 + exp(- ( : … ) * (LAST_EBIDTA - ( : … )))
+#
+# Εάν υπάρχουν NA τιμές στις τιμές του LAST_TURNOVER, LAST_EMPLOYEES, LAST_EBIDTA,
+# τα αντίστοιχα y αντικαθίστανται με 0.8 ως fallback.
+#
+# Το τελικό μοντέλο υπολογίζεται ως: Y_CLASS_MODEL = (y1 * y2 * y3)^(1/3)
+# ===============================================================================================
+summary_text <- sprintf(
+  "# ==============================================================================================================================================================================================\n\
+y1 = %s / (1 + exp(- %s * (LAST_TURNOVER - %s)))\n\
+y2 = %s / (1 + exp(- %s * (LAST_EMPLOYEES - %s)))\n\
+y3 = %s / (1 + exp(- %s * (LAST_EBIDTA - %s)))\n\
+y = (y1 * y2 * y3)^(1/3)\n\
+Εάν υπάρχουν NA τιμές στις τιμές του LAST_TURNOVER, LAST_EMPLOYEES, LAST_EBIDTA,τα αντίστοιχα y αντικαθίστανται με 0.8 ως προκαθορισμένη τιμή.
+# ===============================================================================================",
+  L_hat_x1, k_hat_x1, x0_hat_x1,
+  L_hat_x2, k_hat_x2, x0_hat_x2,
+  L_hat_x3, k_hat_x3, x0_hat_x3
+)
+
+cat(summary_text, "\n")
+
+# ===============================================================================================
+#  ΥΠΟΛΟΓΙΣΜΟΣ ΠΙΝΑΚΑ ΣΤΑΘΕΡΟΤΗΤΑΣ ΜΟΝΤΕΛΟΥ (PSI VALIDATION TABLE)
+# ===============================================================================================
+print(validation_df)
+
+
+
+
+# ===============================================================================================
+
+# 📌 STRESS TEST
+# ===============================================================================================
+
+
+# Φόρτωση βασικών βιβλιοθηκών
+library(data.table)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(caret)
+library(ggplot2)
+library(minpack.lm)
+
+# Ορισμός διαδρομής αρχείου
+INITIAL_DATA <- read.csv("C:/Users/m.bozionelou/OneDrive - Eλληνική Aναπτυξιακή Tράπεζα/ΜΜ/MODEL/INITIAL_DATA.csv", sep=";")
+
+
+# Κάνουμε rename τις στήλες TURNOVER_YEAR_SIGNED σε x1, EMPLOYEES_YEAR_SIGNED σε x2,EBTA_YEAR_SIGNED σε x3.
+INITIAL_DATA <- INITIAL_DATA %>%
+  rename(x1 = `TURNOVER_YEAR_SIGNED`,x2= `EMPLOYEES_YEAR_SIGNED`,x3 = `EBTA_YEAR_SIGNED` )
+
+
+
+# ===============================================================================================
+# 📌 ΣΥΝΑΡΤΗΣΕΙΣ ΣΤΑΤΙΣΤΙΚΗΣ ΑΝΑΛΥΣΗΣ & ΠΡΟΣΟΜΟΙΩΣΗΣ MONTE CARLO 🎲
+# Το παρόν τμήμα περιλαμβάνει βασικές συναρτήσεις για:
+# ✔ Υπολογισμό συνοπτικών στατιστικών μετρικών (min, q1, median, q3, max, IQR)
+# ✔ Καθορισμό διαστημάτων βάσει ποσοστιαίων τιμών
+# ✔ Δημιουργία τυχαίων τιμών τύπου Monte Carlo εντός προκαθορισμένων ορίων
+# ✔ Κατηγοριοποίηση τιμών σε bins για ανάλυση συχνοτήτων
+# ===============================================================================================
+
+
+# ====================================================================
+#   📊  Συνάρτηση: compute_stats_summary
+# Υπολογίζει:
+# - Βασικά στατιστικά: min, q1, median, q3, max
+# - IQR, low και high
+# - Πίνακας τιμών value_table (min, low, q1, median, q3, high, max)
+# - Πίνακας κατηγοριών:(min-low,low-q1, q1-median,median-q3, q3-high, high-max - counts, %, αθροιστικά %)
+# ====================================================================
+compute_stats_summary <- function(data_vector) {
+  # Βασικά στατιστικά
+  min_val    <- min(data_vector, na.rm = TRUE)
+  q1_val     <- quantile(data_vector, 0.25, na.rm = TRUE)
+  median_val <- median(data_vector, na.rm = TRUE)
+  q3_val     <- quantile(data_vector, 0.75, na.rm = TRUE)
+  max_val    <- max(data_vector, na.rm = TRUE)
+  
+  
+  # IQR και όρια
+  IQR_val  <- q3_val - q1_val
+  low_raw  <- q1_val - 1.5 * IQR_val
+  high_raw <- q3_val + 1.5 * IQR_val
+  
+  low_val  <- max(0, low_raw)
+  
+  high_val <- min(high_raw, max_val) 
+  
+  high_val <- max(0, high_raw)
+  
+  # Πίνακας value_table
+  value_tbl <- data.frame(
+    Statistic = c("min", "low", "q1", "median", "q3", "high", "max"),
+    Value     = c(min_val, low_val, q1_val, median_val, q3_val, high_val, max_val))
+  # Κατηγορίες
+  ranges <- list(
+    c(min_val, low_val),
+    c(low_val, q1_val),
+    c(q1_val, median_val),
+    c(median_val, q3_val),
+    c(q3_val, high_val),
+    c(high_val, max_val))
+  counts <- sapply(ranges, function(rg) sum(data_vector >= rg[1] & data_vector < rg[2]))
+  counts[6] <- sum(data_vector >= high_val & data_vector <= max_val)
+  total <- sum(counts)
+  percentages <- round((counts / total) * 100)
+  
+  # Υπολογισμός αθροιστικών ποσοστών 
+  cumulative <- numeric(length(percentages))
+  for (i in seq_along(percentages)) {
+    if (i == 1) {
+      cumulative[i] <- 0
+    } else if (i == 2) {
+      cumulative[i] <- percentages[i] - 1  # Προσαρμογή κατά -1 για να ευθυγραμμιστεί
+    } else {cumulative[i] <- cumulative[i - 1] + percentages[i]}}
+  
+  # Πίνακας κατηγοριών
+  stats_tbl <- data.frame(
+    Category              = c("min-low", "low-q1", "q1-median", "median-q3", "q3-high", "high-max"),
+    Count                 = counts,
+    NumericPercentage     = percentages,
+    Percentage            = paste0(percentages, "%"),
+    CumulativePercentage  = cumulative)
+  
+  list(basic_stats = list
+       ( min     = min_val,
+         q1      = q1_val,
+         median  = median_val,
+         q3      = q3_val,
+         max     = max_val,
+         IQR     = IQR_val,
+         low     = low_val,
+         high    = high_val),
+       value_table = value_tbl,
+       stats_table = stats_tbl)}
+
+
+
+# ====================================================================
+# 🎲 Συνάρτηση: generate_MC_sample
+# Περιγραφή:
+# Δημιουργεί ένα Monte Carlo δείγμα με βάση τα στατιστικά που παρέχονται
+# από τη συνάρτηση compute_stats_summary. Η συνάρτηση είναι δυναμική
+# και μπορεί να εφαρμοστεί σε οποιοδήποτε αριθμητικό διάνυσμα δεδομένων.
+#
+# Είσοδοι:
+# - N: Αριθμός δειγμάτων (προεπιλογή: 10000)
+# - value_tbl: Πίνακας τιμών από compute_stats_summary$value_table
+# - thresholds: Αθροιστικά ποσοστά από compute_stats_summary$stats_table$CumulativePercentage[2:5]
+#
+# Έξοδος:
+# - Ένα data frame με τις στήλες:
+#   - "low-q1", "q1-median", "median-q3", "q3-high", "high-max": Τυχαίες τιμές από τα αντίστοιχα διαστήματα
+#   - "mc": Τυχαίοι ακέραιοι αριθμοί από 0 έως 99
+#   - "final": Η τελική επιλεγμένη τιμή βάσει των thresholds
+# ====================================================================
+
+generate_MC_sample <- function(N = 10000, value_tbl, thresholds) {
+  
+  stopifnot(
+    is.data.frame(value_tbl),
+    all(c("Statistic", "Value") %in% names(value_tbl)),
+    length(thresholds) == 4
+  )
+  
+  if (any(is.na(thresholds))) {
+    stop("Τα thresholds περιέχουν NA. Παρακαλώ ελέγξτε το stats_table$CumulativePercentage.")
+  }
+  
+  # Δημιουργία named vector από το value_tbl
+  vals <- setNames(value_tbl$Value, value_tbl$Statistic)
+  
+  # Έλεγχος για απαραίτητα στατιστικά
+  required_keys <- c("low", "q1", "median", "q3", "high", "max")
+  if (!all(required_keys %in% names(vals))) {
+    stop("Το value_tbl πρέπει να περιλαμβάνει τα: low, q1, median, q3, high, max.")
+  }
+  
+  # Δημιουργία των 5 διαστημάτων
+  mc_df <- data.frame(
+    `low-q1`     = runif(N, vals["low"],    vals["q1"]),
+    `q1-median`  = runif(N, vals["q1"],     vals["median"]),
+    `median-q3`  = runif(N, vals["median"], vals["q3"]),
+    `q3-high`    = runif(N, vals["q3"],     vals["high"]),
+    `high-max`   = runif(N, vals["high"],   vals["max"])
+  )
+  
+  # Δημιουργία δείκτη mc (0-99)
+  mc_df$mc <- sample(0:99, size = N, replace = TRUE)
+  
+  # Συνάρτηση εκχώρησης τελικής τιμής
+  assign_final_value_row <- function(row, thr) {
+    mc_val <- as.numeric(row["mc"])
+    if      (mc_val <= thr[1]) return(as.numeric(row["low.q1"]))
+    else if (mc_val <= thr[2]) return(as.numeric(row["q1.median"]))
+    else if (mc_val <= thr[3]) return(as.numeric(row["median.q3"]))
+    else if (mc_val <= thr[4]) return(as.numeric(row["q3.high"]))
+    else                        return(as.numeric(row["high.max"]))
+  }
+  
+  
+  # Εφαρμογή της συνάρτησης για κάθε γραμμή
+  mc_df$final <- apply(mc_df, 1, function(row) assign_final_value_row(row, thresholds))
+  
+  # Προεπισκόπηση των πρώτων γραμμών
+  cat("\n🔍 Παράδειγμα γραμμών από το MC δε (με final):\n")
+  print(head(mc_df))
+  
+  return(mc_df)
+}
+# ====================================================================
+
+
+
+
+# ====================================================================
+# 🔢 Συνάρτηση: make_bins_summary
+# Περιγραφή:
+# Αυτή η συνάρτηση χωρίζει τα δεδομένα (final_vals) σε ισοδιάστηματα (bins),
+# υπολογίζοντας πόσες τιμές πέφτουν σε κάθε διάστημα.
+#
+# Είσοδοι:
+# - final_vals: Το διάνυσμα των αριθμητικών τιμών που θέλουμε να κατηγοριοποιήσουμε.
+# - n_bins: Ο αριθμός των bins (διαστημάτων) που θέλουμε να δημιουργήσουμε (προεπιλογή: 20).
+#
+# Επιστρέφει:
+# Ένα data frame με:
+# - bin: Δείκτης του bin (1 έως n_bins)
+# - bmin: Κατώτερο όριο κάθε bin
+# - bmax: Ανώτερο όριο κάθε bin
+# - obs: Ο αριθμός των τιμών που ανήκουν σε κάθε bin
+#
+# Σημείωση:
+# Το τελευταίο bin περιλαμβάνει το μέγιστο όριο (<=), έτσι ώστε να καλύπτεται πλήρως το εύρος των τιμών.
+# ====================================================================
+#  Συνάρτηση για  bins 
+make_bins_summary <- function(final_vals, n_bins = 20) {
+  rng   <- range(final_vals, na.rm=TRUE)
+  step  <- diff(rng) / n_bins
+  df    <- data.frame(bin = 1:n_bins)
+  df$bmin <- rng[1] + (df$bin - 1) * step
+  df$bmax <- rng[1] +  df$bin      * step
+  df$obs  <- mapply(function(lo, hi, i) {
+    if (i < n_bins) sum(final_vals >= lo & final_vals <  hi)
+    else            sum(final_vals >= lo & final_vals <= hi)
+  }, df$bmin, df$bmax, df$bin)
+  df
+}
+
+ 
+  
+
+
+# ============================== Χ1 ================================
+
+# ============================================================
+#         ⚙️ DATA PREPARATION  ⚙️
+# ============================================================
+
+# Βήμα 1_x1: Δημιουργία του STRESSTEST_DATA_x1 από το INITIAL_DATA μόνο με τη μεταβλητή x1 και εφαρμογή της συνάρτησης prepare_data_column.
+
+STRESSTEST_DATA_x1 <- prepare_data_column(
+  INITIAL_DATA,      
+  col_name        = "x1",
+  remove_na       = TRUE,
+  filter_outliers = FALSE
+)
+
+STRESSTEST_DATA_x1 <- STRESSTEST_DATA_x1 %>%
+  select(x1)
+
+cat("Πόσα NA υπάρχουν μετά τη μετατροπή για x1:", sum(is.na(STRESSTEST_DATA_x1$x1)), "\n")
+
+# Βήμα 2_x1: Διατήρηση τιμών >= 1 και διαγραφή των τιμών κάτω από 1
+STRESSTEST_DATA_x1 <- STRESSTEST_DATA_x1[STRESSTEST_DATA_x1$x1 >= 1, , drop = FALSE]
+cat("Πόσα NA υπάρχουν μετά τη μετατροπή για x1:", sum(is.na(STRESSTEST_DATA_x1$x1)), "\n")
+
+#Βήμα 3_χ1 Εφαρμογή της συνάρτησης: compute_stats_summary για x1 
+summary_x1 <- compute_stats_summary(STRESSTEST_DATA_x1$x1)
+print(summary_x1$value_table)
+print(summary_x1$stats_table)
+value_x1 <- summary_x1$value_table
+stats_x1 <- summary_x1$stats_table
+
+# Βήμα 4_χ1: Ορισμός των thresholds και εφαρμογή της συνάρτησης: generate_MC_sample για x1.
+final_thresholds_x1 <- stats_x1$CumulativePercentage[2:5]
+x1_MC <- generate_MC_sample(N = 10000, value_tbl = summary_x1$value_table, thresholds = final_thresholds_x1)
+
+# Bημα 5_x1:  Εφαρμόζω το μοντέλο και υπολογίζω το y1.
+x1_MC$y1 <- L_hat_x1 / (1 + exp(-k_hat_x1 * (x1_MC$final - x0_hat_x1)))
+
+
+# Bημα 6_x1:  Εφαρμόζω τη συνάρτηση: make_bins_summary για το x1.
+x1_bins <- make_bins_summary(x1_MC$final)
+print(x1_bins)
+
+
+# Bημα 7_x1: Δημιουργία bar chart για x1_bins.
+ggplot(x1_bins, aes(x = factor(bin), y = obs)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Histogram of x1 (Bins vs Observations)",
+    x = "Bin",
+    y = "Number of Observations"
+  )
+
+# ============================== Χ2 ================================
+
+# ============================================================
+#         ⚙️ DATA PREPARATION  ⚙️
+# ============================================================
+
+# Βήμα 1_x2: Δημιουργία του STRESSTEST_DATA_x2 από το INITIAL_DATA μόνο με τη μεταβλητή x2 και εφαρμόζουμε τη συνάρτηση prepare_data_column.
+STRESSTEST_DATA_x2 <- prepare_data_column(
+  INITIAL_DATA,      
+  col_name        = "x2",
+  remove_na       = TRUE,
+  filter_outliers = FALSE)
+STRESSTEST_DATA_x2 <- STRESSTEST_DATA_x2 %>%
+  select(x2)
+
+cat("Πόσα NA υπάρχουν μετά τη μετατροπή για x2:", sum(is.na(STRESSTEST_DATA_x2$x2)), "\n")
+
+# Βήμα 2_x2: Διατήρηση τιμών >= 1 και διαγραφή των τιμών κάτω από 1
+STRESSTEST_DATA_x2 <- STRESSTEST_DATA_x2[STRESSTEST_DATA_x2$x2 >= 1, , drop = FALSE]
+cat("Πόσα NA υπάρχουν μετά τη μετατροπή για x2:", sum(is.na(STRESSTEST_DATA_x2$x2)), "\n")
+
+# Βήμα 3_χ2 Εφαρμογή της συνάρτησης: compute_stats_summary για x2
+summary_x2 <- compute_stats_summary(STRESSTEST_DATA_x2$x2)
+print(summary_x2$value_table)
+print(summary_x2$stats_table)
+value_x2 <- summary_x2$value_table
+stats_x2 <- summary_x2$stats_table
+
+# Βήμα 4_χ2: Ορισμός των thresholds και εφαρμογή της συνάρτησης: generate_MC_sample.
+final_thresholds_x2 <- stats_x2$CumulativePercentage[2:5]
+x2_MC <- generate_MC_sample(N = 10000, value_tbl = summary_x2$value_table, thresholds = final_thresholds_x2)
+
+# Βήμα 5_x2: Εφαρμόζω το μοντέλο και υπολογίζω το y2.
+x2_MC$y2 <- L_hat_x2 / (1 + exp(-k_hat_x2 * (x2_MC$final - x0_hat_x2)))
+
+# Bημα 6_x2:  Εφαρμόζω τη συνάρτηση: make_bins_summary για το x2.
+x2_bins <- make_bins_summary(x2_MC$final)
+print(x2_bins)
+
+# Bημα 7_x2: Δημιουργία bar chart για x2_bins.
+
+ggplot(x2_bins, aes(x = factor(bin), y = obs)) +
+  geom_bar(stat = "identity", fill = "darkorange") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Histogram of x2 (Bins vs Observations)",
+    x = "Bin",
+    y = "Number of Observations"
+  )
+
+# ============================== Χ3 ================================
+
+# ============================================================
+#         ⚙️ DATA PREPARATION  ⚙️
+# ============================================================
+
+# Βήμα 1_x3: Δημιουργία του STRESSTEST_DATA_x3 από το INITIAL_DATA μόνο με τη μεταβλητή x3 και εφαρμογή της συνάρτησης prepare_data_column.
+STRESSTEST_DATA_x3 <- prepare_data_column(
+  INITIAL_DATA,      
+  col_name        = "x3",
+  remove_na       = TRUE,
+  filter_outliers = FALSE
+)
+STRESSTEST_DATA_x3 <- STRESSTEST_DATA_x3 %>%
+  select(x3)
+cat("Πόσα NA υπάρχουν μετά τη μετατροπή για x3:", sum(is.na(STRESSTEST_DATA_x3$x3)), "\n")
+
+# Βήμα 2_x3: Διατήρηση τιμών >= 1 και διαγραφή των τιμών κάτω από 1
+STRESSTEST_DATA_x3 <- STRESSTEST_DATA_x3[STRESSTEST_DATA_x3$x3 >= 1, , drop = FALSE]
+cat("Πόσα NA υπάρχουν μετά τη μετατροπή για x3:", sum(is.na(STRESSTEST_DATA_x3$x3)), "\n")
+# ============================================================
+
+# Βήμα 3_x3: Εφαρμογή της συνάρτησης: compute_stats_summary για x2
+summary_x3 <- compute_stats_summary(STRESSTEST_DATA_x3$x3)
+print(summary_x3$value_table)
+print(summary_x3$stats_table)
+value_x3 <- summary_x3$value_table
+stats_x3 <- summary_x3$stats_table
+
+# Βήμα 4_χ3: Ορισμός των thresholds και εφαρμογή της συνάρτησης: generate_MC_sample.
+final_thresholds_x3 <- stats_x3$CumulativePercentage[2:5]
+x3_MC <- generate_MC_sample(N = 10000, value_tbl = summary_x3$value_table, thresholds = final_thresholds_x3)
+
+# Βήμα 5_χ3: Εφαρμόζω το μοντέλο και υπολογίζω το y3.
+x3_MC$y3 <- L_hat_x3 / (1 + exp(-k_hat_x3 * (x3_MC$final - x0_hat_x3)))
+
+# Bημα 6_x3:  Εφαρμόζω τη συνάρτηση: make_bins_summary για το x3.
+x3_bins <- make_bins_summary(x3_MC$final)
+print(x3_bins)
+
+# Bημα 7_x3: Δημιουργία bar chart για x3_bins
+
+ggplot(x3_bins, aes(x = factor(bin), y = obs)) +
+  geom_bar(stat = "identity", fill = "forestgreen") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Histogram of x3 (Bins vs Observations)",
+    x = "Bin",
+    y = "Number of Observations"
+  )
+# ============================================================
+
+# ==============================================================
+# Βήμα 8: Δημιουργία νέου data frame ονόματι MC που περιέχει τα y1, y2, y3
+# ==============================================================
+MC <- data.frame(
+  y1 = x1_MC$y1,
+  y2 = x2_MC$y2,
+  y3 = x3_MC$y3
+)
+head(MC)
+
+# --------------------------------------------------------------
+# Βήμα 9: Μετατροπή σε long format για δημιουργία ιστογραμμάτων
+# --------------------------------------------------------------
+MC_long <- pivot_longer(MC, 
+                        cols = c("y1", "y2", "y3"), 
+                        names_to = "variable", 
+                        values_to = "value")
+
+# Βήμα 10 : Δημιουργία ιστογράμματος για τις μεταβλητές y1, y2 και y3
+ggplot(MC_long, aes(x = value)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  facet_wrap(~ variable, scales = "free") +
+  labs(title = "Ιστογράμματα των μεταβλητών y1, y2 και y3",
+       x = "Τιμή",
+       y = "Πλήθος παρατηρήσεων") +
+  theme_minimal(base_size = 14)
+
+
+
+
+# ============================== y1 ================================
+
+# Βήμα 11_y1 Εφαρμογή της συνάρτησης: compute_stats_summary για y1.
+
+summary_y1 <- compute_stats_summary(MC$y1)
+print(summary_y1$value_table)
+print(summary_y1$stats_table)
+
+value_y1 <- summary_y1$value_table
+stats_y1 <- summary_y1$stats_table
+
+# Βήμα 12_y1: Ορισμός των thresholds και εφαρμογή της συνάρτησης: generate_MC_sample για y1.
+final_thresholds_y1 <- stats_x1$CumulativePercentage[2:5]
+x1_MC_II <- generate_MC_sample(N = 10000, value_tbl = value_y1, thresholds = final_thresholds_x1)
+
+# Bημα 13_y1:  Εφαρμόζω τη συνάρτηση: make_bins_summary για το y1.
+y1_bins <- make_bins_summary(x1_MC_II$final)
+
+# Bημα 14_y1: Δημιουργία bar chart για y1_bins
+ggplot(y1_bins, aes(x = factor(bin), y = obs)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Histogram of y1 (Bins vs Observations)",
+    x = "Bin",
+    y = "Number of Observations"
+  )
+
+# ============================== y2 ================================
+#Βήμα 11_y2: Εφαρμογή της συνάρτησης: compute_stats_summary για y2.
+
+summary_y2 <- compute_stats_summary(MC$y2)
+print(summary_y2$value_table)
+print(summary_y2$stats_table)
+
+value_y2 <- summary_y2$value_table
+stats_y2 <- summary_y2$stats_table
+
+# ΒήμαΒήμα 12_y2 : Ορισμός των thresholds και εφαρμογή της συνάρτησης: generate_MC_sample για y1.
+final_thresholds_y2 <- stats_x2$CumulativePercentage[2:5]
+x2_MC_II <- generate_MC_sample(N = 10000, value_tbl = value_y2, thresholds = final_thresholds_x2)
+
+# Bημα Βήμα 13_y2 :  Εφαρμόζω τη συνάρτηση: make_bins_summary για το y2.
+y2_bins <- make_bins_summary(x2_MC_II$final)
+
+# Bημα 14_y2: Δημιουργία bar chart για y2_bins
+ggplot(y2_bins, aes(x = factor(bin), y = obs)) +
+  geom_bar(stat = "identity", fill = "darkorange") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Histogram of y2 (Bins vs Observations)",
+    x = "Bin",
+    y = "Number of Observations"
+  )
+# ============================== y3 ================================
+#Βήμα 11_y3: Εφαρμογή της συνάρτησης: compute_stats_summary για y3.
+
+summary_y3 <- compute_stats_summary(MC$y3)
+print(summary_y3$value_table)
+print(summary_y3$stats_table)
+
+value_y3 <- summary_y3$value_table
+stats_y3 <- summary_y3$stats_table
+
+# Βήμα 12_y3: Ορισμός των thresholds και εφαρμογή της συνάρτησης: generate_MC_sample για y1.
+final_thresholds_y3 <- stats_x3$CumulativePercentage[2:5]
+x3_MC_II <- generate_MC_sample(N = 10000, value_tbl = value_y3, thresholds = final_thresholds_x3)
+
+# Bημα 13_y3:  Εφαρμόζω τη συνάρτηση: make_bins_summary για το y3.
+y3_bins <- make_bins_summary(x3_MC_II$final)
+
+# Bημα 14_y3: Δημιουργία bar chart για y3_bins
+ggplot(y3_bins, aes(x = factor(bin), y = obs)) +
+  geom_bar(stat = "identity", fill = "forestgreen") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Histogram of y3 (Bins vs Observations)",
+    x = "Bin",
+    y = "Number of Observations"
+  )
