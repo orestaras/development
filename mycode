@@ -1,0 +1,316 @@
+#####################################################################
+##  PACKAGES --------------------------------------------------------
+#####################################################################
+library(readr)          # fast + locale-aware CSV import
+library(dplyr)          # data wrangling verbs
+library(stringr)        # string helpers
+library(forcats)        # factor re-leveling
+library(tidyr)          # pivoting
+library(ggplot2)        # plotting
+library(scales)         # comma_format()
+
+#####################################################################
+##  STEP 1  –  read the file into v1 (3 turnover cols) -------------
+#####################################################################
+file_path <- "C:/Users/o.dimgkiokas/Downloads/TURNOVER_YEAR_SIGNED-V1.csv"
+
+v1 <- read_csv2(
+  file_path,
+  locale      = locale(decimal_mark = ",", grouping_mark = "."),
+  na          = c("", " ", "NULL", "NA"),
+  name_repair = make.names
+)
+
+# Uncomment to inspect any parsing issues:
+# problems(v1)
+
+#####################################################################
+##  STEP 2  –  keep only the columns we need -----------------------
+#####################################################################
+keep_cols <- c(
+  "ID_TEPIX",
+  "Καθυστέρηση.CONS",
+  "TURNOVER_TWO_YEARS_AGO",
+  "TURNOVER_PREVIOUS_YEAR",
+  "TURNOVER_YEAR_SIGNED"
+)
+v1 <- v1 %>% select(all_of(keep_cols))
+
+#####################################################################
+##  STEP 3  –  safe numeric coercion & drop non-positive values ----
+#####################################################################
+turnover_cols <- c("TURNOVER_TWO_YEARS_AGO",
+                   "TURNOVER_PREVIOUS_YEAR",
+                   "TURNOVER_YEAR_SIGNED")
+
+v1 <- v1 %>%
+  # convert only if the column is character
+  mutate(across(all_of(turnover_cols),
+                ~ if (is.character(.x)) {
+                  parse_number(.x,
+                               locale = locale(decimal_mark = ",",
+                                               grouping_mark = "."))
+                } else {
+                  .x
+                })) %>%
+  # blank out ≤ 0
+  mutate(across(all_of(turnover_cols),
+                ~ if_else(.x <= 0, NA_real_, .x)))
+
+#####################################################################
+##  STEP 4  –  clean the rows (drop NAs) ----------------------------
+#####################################################################
+v1 <- v1 %>%
+  filter(
+    !is.na(Καθυστέρηση.CONS),
+    !is.na(TURNOVER_TWO_YEARS_AGO),
+    !is.na(TURNOVER_PREVIOUS_YEAR),
+    !is.na(TURNOVER_YEAR_SIGNED)
+  )
+
+#####################################################################
+##  STEP 5  –  create the bucket factor with real labels -----------
+#####################################################################
+v1 <- v1 %>%
+  mutate(
+    Καθυστέρηση.CONS = str_trim(Καθυστέρηση.CONS),
+    bucket = case_when(
+      Καθυστέρηση.CONS == "30dpd"           ~ "30dpd",
+      Καθυστέρηση.CONS == "Προσωρινή"       ~ "Προσωρινή",
+      Καθυστέρηση.CONS == "Οριστική"        ~ "Οριστική",
+      Καθυστέρηση.CONS == "Προς καταγγελία" ~ "Προς καταγγελία",
+      TRUE                                  ~ NA_character_
+    ),
+    bucket = factor(
+      bucket,
+      levels = c("30dpd", "Προσωρινή", "Οριστική", "Προς καταγγελία")
+    )
+  ) %>%
+  filter(!is.na(bucket))
+
+#####################################################################
+##  STEP 6  –  box-plot statistics by bucket -----------------------
+#####################################################################
+bucket_stats <- v1 %>%
+  group_by(bucket) %>%
+  summarise(
+    # 2 Years Ago
+    min_2yr    = min(TURNOVER_TWO_YEARS_AGO, na.rm = TRUE),
+    low_2yr    = boxplot.stats(TURNOVER_TWO_YEARS_AGO)$stats[1],
+    Q1_2yr     = quantile(TURNOVER_TWO_YEARS_AGO, 0.25, na.rm = TRUE),
+    median_2yr = median(TURNOVER_TWO_YEARS_AGO, na.rm = TRUE),
+    Q3_2yr     = quantile(TURNOVER_TWO_YEARS_AGO, 0.75, na.rm = TRUE),
+    high_2yr   = boxplot.stats(TURNOVER_TWO_YEARS_AGO)$stats[5],
+    max_2yr    = max(TURNOVER_TWO_YEARS_AGO, na.rm = TRUE),
+    # Previous Year
+    min_prev   = min(TURNOVER_PREVIOUS_YEAR, na.rm = TRUE),
+    low_prev   = boxplot.stats(TURNOVER_PREVIOUS_YEAR)$stats[1],
+    Q1_prev    = quantile(TURNOVER_PREVIOUS_YEAR, 0.25, na.rm = TRUE),
+    median_prev= median(TURNOVER_PREVIOUS_YEAR, na.rm = TRUE),
+    Q3_prev    = quantile(TURNOVER_PREVIOUS_YEAR, 0.75, na.rm = TRUE),
+    high_prev  = boxplot.stats(TURNOVER_PREVIOUS_YEAR)$stats[5],
+    max_prev   = max(TURNOVER_PREVIOUS_YEAR, na.rm = TRUE),
+    # Current Year
+    min_curr   = min(TURNOVER_YEAR_SIGNED, na.rm = TRUE),
+    low_curr   = boxplot.stats(TURNOVER_YEAR_SIGNED)$stats[1],
+    Q1_curr    = quantile(TURNOVER_YEAR_SIGNED, 0.25, na.rm = TRUE),
+    median_curr= median(TURNOVER_YEAR_SIGNED, na.rm = TRUE),
+    Q3_curr    = quantile(TURNOVER_YEAR_SIGNED, 0.75, na.rm = TRUE),
+    high_curr  = boxplot.stats(TURNOVER_YEAR_SIGNED)$stats[5],
+    max_curr   = max(TURNOVER_YEAR_SIGNED, na.rm = TRUE),
+    n_obs      = n(),
+    .groups    = "drop"
+  )
+
+#####################################################################
+##  STEP 7  –  pivot to “long” format for 3 periods ----------------
+#####################################################################
+v_long <- v1 %>%
+  pivot_longer(
+    cols      = all_of(turnover_cols),
+    names_to  = "period",
+    values_to = "turnover"
+  ) %>%
+  mutate(
+    period = factor(
+      period,
+      levels = turnover_cols,
+      labels = c("2 Years Ago", "Previous Year", "Current Year")
+    )
+  )
+
+#####################################################################
+##  STEP 8  –  box-and-whisker plot by bucket ----------------------
+#####################################################################
+ggplot(v_long, aes(x = bucket, y = turnover, fill = period)) +
+  geom_boxplot(
+    position      = position_dodge(width = 0.8),
+    width         = 0.6,
+    fatten        = 1.2,
+    colour        = "grey25",
+    outlier.shape = NA,
+    alpha         = 0.6
+  ) +
+  scale_fill_manual(
+    values = c("2 Years Ago"   = "#FC8D59",
+               "Previous Year" = "#FEE08B",
+               "Current Year"  = "#D73027"),
+    name = "Period"
+  ) +
+  scale_y_continuous(
+    labels = comma_format(big.mark = ".", decimal.mark = ",")
+  ) +
+  coord_cartesian(ylim = c(0, 3500000)) +   # y-axis up to €3.5 M
+  labs(
+    title    = "Κατανομή Κύκλου Εργασιών ανά Bucket & Period",
+    subtitle = "Κύκλος εργασιών 3 ετών",
+    x        = "Bucket",
+    y        = "Turnover (€)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    axis.ticks.x       = element_blank(),
+    axis.title.x       = element_text(vjust = -0.5),
+    plot.title         = element_text(face = "bold"),
+    legend.position    = "top"
+  )
+
+#####################################################################
+##  STEP 9  –  remove outliers across the 3 periods ----------------
+#####################################################################
+v2 <- v1 %>%
+  left_join(
+    bucket_stats %>%
+      select(bucket,
+             low_2yr, high_2yr,
+             low_prev, high_prev,
+             low_curr, high_curr),
+    by = "bucket"
+  ) %>%
+  filter(
+    TURNOVER_TWO_YEARS_AGO   >= low_2yr,
+    TURNOVER_TWO_YEARS_AGO   <= high_2yr,
+    TURNOVER_PREVIOUS_YEAR   >= low_prev,
+    TURNOVER_PREVIOUS_YEAR   <= high_prev,
+    TURNOVER_YEAR_SIGNED     >= low_curr,
+    TURNOVER_YEAR_SIGNED     <= high_curr
+  ) %>%
+  select(-starts_with("low_"), -starts_with("high_"))
+
+#####################################################################
+##  STEP 10 –  recalc stats per bucket (without outliers) ----------
+#####################################################################
+bucket_stats_v2 <- v2 %>%
+  group_by(bucket) %>%
+  summarise(
+    # 2 Years Ago
+    min_2yr    = min(TURNOVER_TWO_YEARS_AGO, na.rm = TRUE),
+    low_2yr    = boxplot.stats(TURNOVER_TWO_YEARS_AGO)$stats[1],
+    Q1_2yr     = quantile(TURNOVER_TWO_YEARS_AGO, 0.25, na.rm = TRUE),
+    median_2yr = median(TURNOVER_TWO_YEARS_AGO, na.rm = TRUE),
+    Q3_2yr     = quantile(TURNOVER_TWO_YEARS_AGO, 0.75, na.rm = TRUE),
+    high_2yr   = boxplot.stats(TURNOVER_TWO_YEARS_AGO)$stats[5],
+    max_2yr    = max(TURNOVER_TWO_YEARS_AGO, na.rm = TRUE),
+    # Previous Year
+    min_prev   = min(TURNOVER_PREVIOUS_YEAR, na.rm = TRUE),
+    low_prev   = boxplot.stats(TURNOVER_PREVIOUS_YEAR)$stats[1],
+    Q1_prev    = quantile(TURNOVER_PREVIOUS_YEAR, 0.25, na.rm = TRUE),
+    median_prev= median(TURNOVER_PREVIOUS_YEAR, na.rm = TRUE),
+    Q3_prev    = quantile(TURNOVER_PREVIOUS_YEAR, 0.75, na.rm = TRUE),
+    high_prev  = boxplot.stats(TURNOVER_PREVIOUS_YEAR)$stats[5],
+    max_prev   = max(TURNOVER_PREVIOUS_YEAR, na.rm = TRUE),
+    # Current Year
+    min_curr   = min(TURNOVER_YEAR_SIGNED, na.rm = TRUE),
+    low_curr   = boxplot.stats(TURNOVER_YEAR_SIGNED)$stats[1],
+    Q1_curr    = quantile(TURNOVER_YEAR_SIGNED, 0.25, na.rm = TRUE),
+    median_curr= median(TURNOVER_YEAR_SIGNED, na.rm = TRUE),
+    Q3_curr    = quantile(TURNOVER_YEAR_SIGNED, 0.75, na.rm = TRUE),
+    high_curr  = boxplot.stats(TURNOVER_YEAR_SIGNED)$stats[5],
+    max_curr   = max(TURNOVER_YEAR_SIGNED, na.rm = TRUE),
+    n_obs      = n(),
+    .groups    = "drop"
+  )
+
+#####################################################################
+##  STEP 11 –  pivot v2 to “long” for plotting ---------------------
+#####################################################################
+v2_long <- v2 %>%
+  pivot_longer(
+    cols      = all_of(turnover_cols),
+    names_to  = "period",
+    values_to = "turnover"
+  ) %>%
+  mutate(
+    period = factor(
+      period,
+      levels = turnover_cols,
+      labels = c("2 Years Ago", "Previous Year", "Current Year")
+    )
+  )
+
+#####################################################################
+##  STEP 12 –  final box-and-whisker plot (outliers removed) -------
+#####################################################################
+ggplot(v2_long, aes(x = bucket, y = turnover, fill = period)) +
+  geom_boxplot(
+    position      = position_dodge(width = 0.8),
+    width         = 0.6,
+    fatten        = 1.2,
+    colour        = "grey25",
+    outlier.shape = NA,
+    alpha         = 0.6
+  ) +
+  scale_fill_manual(
+    values = c("2 Years Ago"   = "#F4A7B9",
+               "Previous Year" = "#8BCB82",
+               "Current Year"  = "#9FB5FF"),
+    name = "Period"
+  ) +
+  scale_y_continuous(
+    labels = comma_format(big.mark = ".", decimal.mark = ",")
+  ) +
+  coord_cartesian(ylim = c(0, 3500000)) +   # y-axis up to €3.5 M
+  labs(
+    title    = "Κατανομή κύκλου εργασιών ανά επίπεδο καθυστέρησης",
+    subtitle = "Κύκλος εργασιών 3 ετών (χωρίς ακραίες τιμές)",
+    x        = "Καθυστέρηση",
+    y        = "Κύκλος εργασιών (€)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    axis.ticks.x       = element_blank(),
+    axis.title.x       = element_text(vjust = -0.5),
+    plot.title         = element_text(face = "bold"),
+    legend.position    = "top"
+  )
+
+#####################################################################
+##  STEP 13 –  summary tables per bucket ---------------------------
+#####################################################################
+boxplot_stats_long <- v2_long %>%
+  group_by(bucket, period) %>%
+  summarise(
+    min    = min(turnover, na.rm = TRUE),
+    low    = boxplot.stats(turnover)$stats[1],   # Tukey lower fence
+    Q1     = quantile(turnover, 0.25, na.rm = TRUE),
+    median = median(turnover, na.rm = TRUE),
+    Q3     = quantile(turnover, 0.75, na.rm = TRUE),
+    high   = boxplot.stats(turnover)$stats[5],   # Tukey upper fence
+    max    = max(turnover, na.rm = TRUE),
+    n_obs  = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(bucket, period)
+
+# split into one table per bucket
+bucket_summary_tables <- split(boxplot_stats_long, boxplot_stats_long$bucket)
+
+# print each table
+for (name in names(bucket_summary_tables)) {
+  cat("\n### Boxplot stats for Bucket:", name, "###\n")
+  print(bucket_summary_tables[[name]])
+}
